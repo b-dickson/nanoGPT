@@ -45,9 +45,10 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'wikitext103'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+#gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+#batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 128
 # model
 n_layer = 12
 n_head = 12
@@ -57,14 +58,15 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 20 # total number of training iterations
+max_epochs = 10
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+warmup_iters = 10 # how many steps to warm up for
+lr_decay_iters = 60000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -72,11 +74,14 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+total_batch_size = 16384 # max number for A100 40GB
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+uc_size=block_size
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -98,8 +103,20 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+#tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+#print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+
+multiple = block_size // uc_size
+total_tokens_per_batch = multiple * total_batch_size
+print(f"given {total_batch_size}, total tokens per batch (stride = uc_size = {uc_size}): {total_tokens_per_batch}")
+batch_size = total_tokens_per_batch // block_size
+print(f"calculated batch size: {batch_size}")
+tokens_per_fwdbwd = batch_size * block_size * ddp_world_size
+print(f"tokens per fwdbwd (pre gradient accumulation): {tokens_per_fwdbwd}")
+assert total_tokens_per_batch % tokens_per_fwdbwd == 0
+gradient_accumulation_steps = total_tokens_per_batch // tokens_per_fwdbwd
+print(f"=> calculated gradient accumulation steps: {gradient_accumulation_steps}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -130,35 +147,61 @@ data_dir = os.path.join('data', dataset)
 #        x, y = x.to(device), y.to(device)
 #    return x, y
 
-def get_batch(split='train', single_pass=False):
-    if split == 'train':
-        data_path = os.path.join(data_dir, f'train.bin')
-    elif split == 'val':
+def get_batch_train(single_pass=False):
+    data_path = os.path.join(data_dir, f'train.bin')
+    data = np.memmap(data_path, dtype=np.uint16, mode='r')
+    total_elements = len(data) - 1
+    global iters_per_epoch
+
+    stride_length = int(block_size)
+
+    indices = np.arange(0, total_elements - block_size, stride_length)
+    #np.random.shuffle(indices)
+    iters_per_epoch = int((len(indices) - batch_size + 1) / (batch_size * gradient_accumulation_steps))
+
+    global epoch
+    while True:
+        for i in range(0, len(indices) - batch_size + 1, batch_size):
+            #print0(i, len(indices) - batch_size + 1)
+            x_batch = []
+            y_batch = []
+            for j in range(batch_size):
+                start_idx = indices[i + j]
+                if start_idx + block_size + 1 > total_elements:
+                    continue
+                x = torch.from_numpy(data[start_idx:start_idx + block_size].astype(np.int64))
+                y = torch.from_numpy(data[start_idx + 1:start_idx + block_size + 1].astype(np.int64))
+                x_batch.append(x)
+                y_batch.append(y)
+            
+            if len(x_batch) == batch_size:
+                x_batch = torch.stack(x_batch).to(device)
+                y_batch = torch.stack(y_batch).to(device)
+                yield x_batch, y_batch
+        
+        epoch += 1
+        #print0(f"Finished epoch: {epoch}")
+        if wandb_log:
+            wandb.log({'iter':iter_num, 'epoch': epoch})
+        
+        if single_pass:
+            break  # Exit after one complete pass through the data
+        #np.random.shuffle(indices)
+
+def get_batch_eval(split, single_pass=True):
+    if split == 'val':
         data_path = os.path.join(data_dir, f'val.bin')
     elif split == 'test':
         data_path = os.path.join(data_dir, f'test.bin')
     else:
-        raise ValueError(f"split must be 'train', 'val' or 'test', got {split}")
-
+        raise ValueError(f"split must be 'val' or 'test', got {split}")
     data = np.memmap(data_path, dtype=np.uint16, mode='r')
     total_elements = len(data) - 1
 
     stride_length = int(block_size)
 
     indices = np.arange(0, total_elements - block_size, stride_length)
-    #print0(f"Total elements: {total_elements}, indices: {len(indices)}")
 
-    # Uncomment if you want to shuffle first epoch batches
-    #np.random.shuffle(indices)
-
-    # uncomment if you want to see how many iters per epoch
-    #if split == 'train':
-        #global iters_per_epoch
-        #iters_per_epoch = int((len(indices) - batch_size + 1) / (batch_size * gradient_accumulation_steps))
-        #print0('iters per epoch:', iters_per_epoch)
-        #print0('iters for 150 epochs:', iters_per_epoch * 150)
-
-    global epoch
     while True:
         for i in range(0, len(indices) - batch_size + 1, batch_size):
             x_batch = []
@@ -176,21 +219,14 @@ def get_batch(split='train', single_pass=False):
                 x_batch = torch.stack(x_batch).to(device)
                 y_batch = torch.stack(y_batch).to(device)
                 yield x_batch, y_batch
-        
-        # logging
-        if split == 'train':
-            epoch += 1
-            #print0(f"Finished epoch: {epoch}")
-            if wandb_log:
-                wandb.log({'iter': iter_num, 'epoch': epoch})
-        
-        # for eval, this stops after one epoch
+
         if single_pass:
             break
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+epoch=0
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -251,7 +287,8 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+#scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler(device=device, enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -289,12 +326,12 @@ if ddp:
 def estimate_loss():
     model.eval()  # Switch the model to evaluation mode
     results = {}
-    splits = ['val', 'test']
+    splits = ['val', 'test'] if dataset != 'billionword' else ['val']  # Exclude 'test' for 'billionword'
 
     for split in splits:
         running_loss = 0.0
         iter_count = 0
-        data_iter = iter(get_batch(split=split))
+        data_iter = iter(get_batch_eval(split=split))
 
         while True:
             try:
@@ -302,6 +339,7 @@ def estimate_loss():
                 logits, loss = model(X, Y)  # Compute output and loss
                 running_loss += loss.item()
                 iter_count += 1
+
             except StopIteration:
                 break  # Exit the loop when no more data is available
 
@@ -338,40 +376,91 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, group=wandb_group_name, entity=entity)
+    wandb.config.update({
+        "tokens_per_iter": total_batch_size,
+        "n_param": n_param,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "id": wandb.run.id,
+        "tokens_pre_gradient_accumulation": tokens_per_fwdbwd
+    }, allow_val_change=True)
 
-# training loop
-#X, Y = get_batch('train') # fetch the very first batch
-train_iter = iter(get_batch(split='train'))
-X, Y = next(train_iter)
+## training loop
+train_iter = iter(get_batch_train())
+X, Y = next(train_iter) # get first batch
 
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
 
+if wandb_log and master_process:
+    wandb.log({'iter':iter_num, 'epoch': epoch})
+
+# Initialize tracking variables for minimum metrics
+min_test_loss = float('inf')
+min_test_perplexity = float('inf')
+min_val_loss = float('inf')
+min_val_perplexity = float('inf')
+
+epoch_prev = epoch
+while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+    if (iter_num % eval_interval == 0 and master_process) or epoch != epoch_prev:
+        losses_and_perplexities = estimate_loss()  # This calls your estimate_loss function
+        if epoch != epoch_prev:
+            epoch_prev = epoch
+
+        # Update minimum values
+        min_val_loss = min(min_val_loss, losses_and_perplexities['val'][0])
+        min_val_perplexity = min(min_val_perplexity, losses_and_perplexities['val'][1])
+        if dataset != 'billionword':
+            min_test_loss = min(min_test_loss, losses_and_perplexities['test'][0])
+            min_test_perplexity = min(min_test_perplexity, losses_and_perplexities['test'][1])
+
+        if dataset != 'billionword':
+            print(f"step {iter_num}, "
+                f"val loss {losses_and_perplexities['val'][0]:.4f}, val perplexity {losses_and_perplexities['val'][1]:.4f}, "
+                f"test loss {losses_and_perplexities['test'][0]:.4f}, test perplexity {losses_and_perplexities['test'][1]:.4f}")
+        else:
+            print(f"step {iter_num}, "
+                f"val loss {losses_and_perplexities['val'][0]:.4f}, val perplexity {losses_and_perplexities['val'][1]:.4f}")
+
         if wandb_log:
-            wandb.log({
+            if dataset != 'billionword':
+            
+                wandb.log({
                     "iter": iter_num,
-                    "val/loss": losses['val'][0],
-                    "val/perplexity": losses['val'][1],
-                    "test/loss": losses['test'][0],
-                    "test/perplexity": losses['test'][1],
+                    "val/loss": losses_and_perplexities['val'][0],
+                    "val/perplexity": losses_and_perplexities['val'][1],
+                    "test/loss": losses_and_perplexities['test'][0],
+                    "test/perplexity": losses_and_perplexities['test'][1],
+                    "min val/loss": min_val_loss,
+                    "min val/perplexity": min_val_perplexity,
+                    "min test/loss": min_test_loss,
+                    "min test/perplexity": min_test_perplexity,
                     "lr": lr,
                     "mfu": running_mfu * 100,  # convert to percentage
                 })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+            else: 
+                wandb.log({
+                    "iter": iter_num,
+                    "val/loss": losses_and_perplexities['val'][0],
+                    "val/perplexity": losses_and_perplexities['val'][1],
+                    "min val/loss": min_val_loss,
+                    "min val/perplexity": min_val_perplexity,
+                    "lr": lr,
+                    "mfu": running_mfu * 100,  # convert to percentage
+                })
+
+        # Check if current validation loss is the best or if always saving checkpoints
+        if losses_and_perplexities['val'][0] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses_and_perplexities['val'][0]
+            best_test_loss = min_test_loss  # Update best test loss when updating checkpoint
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -379,12 +468,17 @@ while True:
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
+                    'best_test_loss': best_test_loss,  # Save best test loss
                     'config': config,
+                    'epoch': epoch
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and eval_only:
         break
+
+    n_param = model.get_num_params()
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -398,9 +492,9 @@ while True:
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        #X, Y = get_batch('train')
-        X, Y = next('train')
+        X, Y = next(train_iter)
 
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
@@ -422,15 +516,22 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        perplexity = math.exp(lossf)
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, perplexity {perplexity:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": lossf,
+                "train/perplexity": perplexity,
+            })
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if (iter_num > max_iters) or (epoch > max_epochs):
         break
 
 if ddp:
