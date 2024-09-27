@@ -33,9 +33,9 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 10
 log_interval = 1
-eval_iters = 200
+eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -44,7 +44,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'wikitext103'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -56,7 +56,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 20 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -113,22 +113,80 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#def get_batch(split):
+#    # We recreate np.memmap every batch to avoid a memory leak, as per
+#    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#    if split == 'train':
+#        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#    else:
+#        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#    ix = torch.randint(len(data) - block_size, (batch_size,))
+#    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#    if device_type == 'cuda':
+#        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#    else:
+#        x, y = x.to(device), y.to(device)
+#    return x, y
+
+def get_batch(split='train', single_pass=False):
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        data_path = os.path.join(data_dir, f'train.bin')
+    elif split == 'val':
+        data_path = os.path.join(data_dir, f'val.bin')
+    elif split == 'test':
+        data_path = os.path.join(data_dir, f'test.bin')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        raise ValueError(f"split must be 'train', 'val' or 'test', got {split}")
+
+    data = np.memmap(data_path, dtype=np.uint16, mode='r')
+    total_elements = len(data) - 1
+
+    stride_length = int(block_size)
+
+    indices = np.arange(0, total_elements - block_size, stride_length)
+    #print0(f"Total elements: {total_elements}, indices: {len(indices)}")
+
+    # Uncomment if you want to shuffle first epoch batches
+    #np.random.shuffle(indices)
+
+    # uncomment if you want to see how many iters per epoch
+    #if split == 'train':
+        #global iters_per_epoch
+        #iters_per_epoch = int((len(indices) - batch_size + 1) / (batch_size * gradient_accumulation_steps))
+        #print0('iters per epoch:', iters_per_epoch)
+        #print0('iters for 150 epochs:', iters_per_epoch * 150)
+
+    global epoch
+    while True:
+        for i in range(0, len(indices) - batch_size + 1, batch_size):
+            x_batch = []
+            y_batch = []
+            for j in range(batch_size):
+                start_idx = indices[i + j]
+                if start_idx + block_size + 1 > total_elements:
+                    continue
+                x = torch.from_numpy(data[start_idx:start_idx + block_size].astype(np.int64))
+                y = torch.from_numpy(data[start_idx + 1:start_idx + block_size + 1].astype(np.int64))
+                x_batch.append(x)
+                y_batch.append(y)
+            
+            if len(x_batch) == batch_size:
+                x_batch = torch.stack(x_batch).to(device)
+                y_batch = torch.stack(y_batch).to(device)
+                yield x_batch, y_batch
+        
+        # logging
+        if split == 'train':
+            epoch += 1
+            #print0(f"Finished epoch: {epoch}")
+            if wandb_log:
+                wandb.log({'iter': iter_num, 'epoch': epoch})
+        
+        # for eval, this stops after one epoch
+        if single_pass:
+            break
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -212,20 +270,56 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+#@torch.no_grad()
+#def estimate_loss():
+#    out = {}
+#    model.eval()
+#    for split in ['train', 'val']:
+#        losses = torch.zeros(eval_iters)
+#        for k in range(eval_iters):
+#            X, Y = get_batch(split)
+#            with ctx:
+#                logits, loss = model(X, Y)
+#            losses[k] = loss.item()
+#        out[split] = losses.mean()
+#    model.train()
+#    return out
+
 @torch.no_grad()
 def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+    model.eval()  # Switch the model to evaluation mode
+    results = {}
+    splits = ['val', 'test']
+
+    for split in splits:
+        running_loss = 0.0
+        iter_count = 0
+        data_iter = iter(get_batch(split=split))
+
+        while True:
+            try:
+                X, Y = next(data_iter)  # Get the next batch
+                logits, loss = model(X, Y)  # Compute output and loss
+                running_loss += loss.item()
+                iter_count += 1
+            except StopIteration:
+                break  # Exit the loop when no more data is available
+
+        # Compute the average loss and perplexity
+        if iter_count > 0:
+            avg_loss = running_loss / iter_count
+            if split == 'val':
+                perplexity = torch.exp(torch.tensor(avg_loss)) if avg_loss < 100 else float('inf')  # to avoid overflow
+            elif split == 'test':
+                perplexity = torch.exp(torch.tensor(avg_loss)) if avg_loss < 100 else float('inf')
+        else:
+            avg_loss = float('inf')
+            perplexity = float('inf')
+
+        results[split] = (avg_loss, perplexity)
+
+    model.train()  # Switch the model back to training mode
+    return results
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -247,7 +341,10 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+#X, Y = get_batch('train') # fetch the very first batch
+train_iter = iter(get_batch(split='train'))
+X, Y = next(train_iter)
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -265,12 +362,14 @@ while True:
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+                    "iter": iter_num,
+                    "val/loss": losses['val'][0],
+                    "val/perplexity": losses['val'][1],
+                    "test/loss": losses['test'][0],
+                    "test/perplexity": losses['test'][1],
+                    "lr": lr,
+                    "mfu": running_mfu * 100,  # convert to percentage
+                })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -300,7 +399,9 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        #X, Y = get_batch('train')
+        X, Y = next('train')
+
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
