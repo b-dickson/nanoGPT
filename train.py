@@ -309,6 +309,8 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+n_param = model.get_num_params()
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 #@torch.no_grad()
 #def estimate_loss():
@@ -481,7 +483,6 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    n_param = model.get_num_params()
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
